@@ -9,7 +9,8 @@ function App() {
     const [messages, setMessages] = useState([
         {
             role: 'assistant',
-            content: 'Selamat datang di Bakery PoS! 🧁 Saya siap membantu Anda memesan kue favorit. Apa yang ingin Anda pesan hari ini?'
+            content: 'Selamat datang di Bakery PoS! 🧁 Saya siap membantu menjawab pertanyaan tentang menu dan produk kami. Ada yang bisa saya bantu?',
+            timestamp: new Date()
         }
     ]);
     const [input, setInput] = useState('');
@@ -18,6 +19,35 @@ function App() {
 
     const scrollToBottom = () => {
         messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    };
+
+    // Function to render message content with clickable links
+    const renderMessageContent = (content) => {
+        if (!content) return null;
+
+        // Regex to match URLs
+        const urlRegex = /(https?:\/\/[^\s]+)/g;
+        const parts = content.split(urlRegex);
+
+        return parts.map((part, index) => {
+            if (urlRegex.test(part)) {
+                // Reset regex lastIndex
+                urlRegex.lastIndex = 0;
+                const isExternal = part.includes('wa.me') || !part.includes('localhost');
+                return (
+                    <a
+                        key={index}
+                        href={part}
+                        target={isExternal ? '_blank' : '_self'}
+                        rel={isExternal ? 'noopener noreferrer' : ''}
+                        className="chat-link"
+                    >
+                        {part}
+                    </a>
+                );
+            }
+            return part;
+        });
     };
 
     useEffect(() => {
@@ -30,28 +60,44 @@ function App() {
 
         const userMessage = input.trim();
         setInput('');
-        
+
         // Add user message
-        setMessages(prev => [...prev, { role: 'user', content: userMessage }]);
+        setMessages(prev => [...prev, { role: 'user', content: userMessage, timestamp: new Date() }]);
         setLoading(true);
 
         try {
-            // Simulate API call - replace with actual chatbot API
-            // const response = await api.chat.send({ message: userMessage });
-            
-            // Temporary mock response
-            setTimeout(() => {
+            // Generate or get session ID from sessionStorage
+            let sessionId = sessionStorage.getItem('chatSessionId');
+            if (!sessionId) {
+                sessionId = 'session_' + Date.now() + '_' + Math.random().toString(36).substring(2, 9);
+                sessionStorage.setItem('chatSessionId', sessionId);
+            }
+
+            // Call Ollama chatbot API
+            const response = await api.chatbot.send(sessionId, userMessage);
+
+            if (response.success && response.data) {
                 setMessages(prev => [...prev, {
                     role: 'assistant',
-                    content: 'Maaf, sistem chatbot sedang dalam pengembangan. Namun saya bisa membantu Anda dengan informasi berikut:\n\n🧁 Menu Tersedia:\n- Chocolate Cake\n- Vanilla Cupcake\n- Red Velvet\n- Croissant\n\nSilakan tanyakan ketersediaan atau buat pesanan!'
+                    content: response.data.response,
+                    actions: response.data.actions,
+                    timestamp: new Date()
                 }]);
-                setLoading(false);
-            }, 1000);
+            } else {
+                setMessages(prev => [...prev, {
+                    role: 'assistant',
+                    content: response.error || 'Maaf, terjadi kesalahan. Silakan coba lagi.',
+                    timestamp: new Date()
+                }]);
+            }
         } catch (error) {
+            console.error('Chat error:', error);
             setMessages(prev => [...prev, {
                 role: 'assistant',
-                content: 'Maaf, terjadi kesalahan. Silakan coba lagi.'
+                content: 'Maaf, toko sedang offline. Silakan coba lagi nanti atau hubungi admin.',
+                timestamp: new Date()
             }]);
+        } finally {
             setLoading(false);
         }
     };
@@ -59,8 +105,8 @@ function App() {
     const quickActions = [
         '🍰 Lihat menu',
         '📦 Cek ketersediaan',
-        '🛒 Buat pesanan',
-        '📞 Hubungi kami'
+        '🛒 Cara pesan',
+        '🎂 Custom cake'
     ];
 
     return (
@@ -92,15 +138,15 @@ function App() {
                             </div>
                             <div className="message-content">
                                 <div className="message-text">
-                                    {message.content}
+                                    {renderMessageContent(message.content)}
                                 </div>
                                 <div className="message-time">
-                                    {new Date().toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' })}
+                                    {message.timestamp?.toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' }) || ''}
                                 </div>
                             </div>
                         </div>
                     ))}
-                    
+
                     {loading && (
                         <div className="message assistant">
                             <div className="message-avatar">🤖</div>
@@ -144,8 +190,8 @@ function App() {
                         onChange={(e) => setInput(e.target.value)}
                         disabled={loading}
                     />
-                    <button 
-                        type="submit" 
+                    <button
+                        type="submit"
                         className="send-button"
                         disabled={!input.trim() || loading}
                     >

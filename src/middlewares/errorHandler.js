@@ -98,7 +98,7 @@ export const errorHandler = (err, req, res, next) => {
         });
     }
 
-    // Handle Supabase errors
+    // Handle PostgreSQL errors
     if (err.code && err.message && err.details) {
         // PostgreSQL unique violation
         if (err.code === '23505') {

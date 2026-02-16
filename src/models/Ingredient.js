@@ -3,7 +3,7 @@
  * Handles all database operations for ingredients table
  */
 
-import supabase from '../utils/supabaseClient.js';
+import { query } from '../utils/db.js';
 
 const Ingredient = {
     /**
@@ -12,17 +12,8 @@ const Ingredient = {
      * @returns {Object|null} Ingredient object or null
      */
     async findById(id) {
-        const { data, error } = await supabase
-            .from('ingredients')
-            .select('*')
-            .eq('id', id)
-            .single();
-
-        if (error && error.code !== 'PGRST116') {
-            console.error('❌ Error finding ingredient:', error);
-            throw error;
-        }
-        return data;
+        const { rows } = await query('SELECT * FROM ingredients WHERE id = $1', [id]);
+        return rows[0] || null;
     },
 
     /**
@@ -31,16 +22,11 @@ const Ingredient = {
      * @returns {Object|null} Ingredient object or null
      */
     async findByName(name) {
-        const { data, error } = await supabase
-            .from('ingredients')
-            .select('*')
-            .ilike('name', name)
-            .single();
-
-        if (error && error.code !== 'PGRST116') {
-            console.error('❌ Error finding ingredient by name:', error);
-        }
-        return data;
+        const { rows } = await query(
+            'SELECT * FROM ingredients WHERE LOWER(name) = LOWER($1)',
+            [name]
+        );
+        return rows[0] || null;
     },
 
     /**
@@ -49,32 +35,37 @@ const Ingredient = {
      * @returns {Object} { ingredients, total, page, limit, totalPages }
      */
     async findAll({ page = 1, limit = 20, search = null } = {}) {
-        let query = supabase
-            .from('ingredients')
-            .select('*', { count: 'exact' });
+        const conditions = [];
+        const params = [];
+        let paramIdx = 1;
 
         if (search) {
-            query = query.ilike('name', `%${search}%`);
+            conditions.push(`name ILIKE $${paramIdx++}`);
+            params.push(`%${search}%`);
         }
 
-        const from = (page - 1) * limit;
-        const to = from + limit - 1;
+        const whereClause = conditions.length > 0 ? 'WHERE ' + conditions.join(' AND ') : '';
 
-        const { data, error, count } = await query
-            .order('name', { ascending: true })
-            .range(from, to);
+        const countResult = await query(
+            `SELECT COUNT(*) FROM ingredients ${whereClause}`,
+            params
+        );
+        const total = parseInt(countResult.rows[0].count);
 
-        if (error) {
-            console.error('❌ Error finding ingredients:', error);
-            throw error;
-        }
+        const offset = (page - 1) * limit;
+        const { rows } = await query(
+            `SELECT * FROM ingredients ${whereClause}
+             ORDER BY name ASC
+             LIMIT $${paramIdx++} OFFSET $${paramIdx++}`,
+            [...params, limit, offset]
+        );
 
         return {
-            ingredients: data,
-            total: count,
+            ingredients: rows,
+            total,
             page,
             limit,
-            totalPages: Math.ceil(count / limit)
+            totalPages: Math.ceil(total / limit)
         };
     },
 
@@ -84,25 +75,21 @@ const Ingredient = {
      * @returns {Object} Created ingredient
      */
     async create(ingredientData) {
-        const { data, error } = await supabase
-            .from('ingredients')
-            .insert({
-                name: ingredientData.name,
-                unit: ingredientData.unit,
-                stock_quantity: ingredientData.stock_quantity || 0,
-                min_stock_threshold: ingredientData.min_stock_threshold || 0,
-                unit_price: ingredientData.unit_price
-            })
-            .select('*')
-            .single();
+        const { rows } = await query(
+            `INSERT INTO ingredients (name, unit, stock_quantity, min_stock_threshold, unit_price)
+             VALUES ($1, $2, $3, $4, $5)
+             RETURNING *`,
+            [
+                ingredientData.name,
+                ingredientData.unit,
+                ingredientData.stock_quantity || 0,
+                ingredientData.min_stock_threshold || 0,
+                ingredientData.unit_price
+            ]
+        );
 
-        if (error) {
-            console.error('❌ Error creating ingredient:', error);
-            throw error;
-        }
-
-        console.log(`✅ Ingredient created: ${data.name}`);
-        return data;
+        console.log(`✅ Ingredient created: ${rows[0].name}`);
+        return rows[0];
     },
 
     /**
@@ -112,20 +99,18 @@ const Ingredient = {
      * @returns {Object} Updated ingredient
      */
     async update(id, updateData) {
-        const { data, error } = await supabase
-            .from('ingredients')
-            .update(updateData)
-            .eq('id', id)
-            .select('*')
-            .single();
+        const fields = Object.keys(updateData);
+        const values = Object.values(updateData);
+        const setClause = fields.map((f, i) => `${f} = $${i + 2}`).join(', ');
 
-        if (error) {
-            console.error('❌ Error updating ingredient:', error);
-            throw error;
-        }
+        const { rows } = await query(
+            `UPDATE ingredients SET ${setClause} WHERE id = $1 RETURNING *`,
+            [id, ...values]
+        );
 
-        console.log(`✅ Ingredient updated: ${data.name}`);
-        return data;
+        if (rows.length === 0) throw new Error('Ingredient not found');
+        console.log(`✅ Ingredient updated: ${rows[0].name}`);
+        return rows[0];
     },
 
     /**
@@ -134,16 +119,7 @@ const Ingredient = {
      * @returns {boolean} True if deleted
      */
     async delete(id) {
-        const { error } = await supabase
-            .from('ingredients')
-            .delete()
-            .eq('id', id);
-
-        if (error) {
-            console.error('❌ Error deleting ingredient:', error);
-            throw error;
-        }
-
+        await query('DELETE FROM ingredients WHERE id = $1', [id]);
         console.log(`✅ Ingredient deleted: ${id}`);
         return true;
     },
@@ -153,32 +129,13 @@ const Ingredient = {
      * @returns {Array} Ingredients where stock <= threshold
      */
     async findLowStock() {
-        const { data, error } = await supabase
-            .from('v_low_stock_ingredients')
-            .select('*');
-
-        if (error) {
-            // If view doesn't exist, use direct query
-            console.log('⚠️ View not available, using direct query');
-            const { data: directData, error: directError } = await supabase
-                .from('ingredients')
-                .select('*')
-                .lte('stock_quantity', supabase.raw('min_stock_threshold'));
-
-            if (directError) {
-                // Fallback: get all and filter
-                const { data: allData, error: allError } = await supabase
-                    .from('ingredients')
-                    .select('*');
-
-                if (allError) throw allError;
-
-                return allData.filter(i => i.stock_quantity <= i.min_stock_threshold);
-            }
-            return directData;
-        }
-
-        return data;
+        const { rows } = await query(
+            `SELECT *, (min_stock_threshold - stock_quantity) AS shortage_amount
+             FROM ingredients
+             WHERE stock_quantity <= min_stock_threshold
+             ORDER BY (min_stock_threshold - stock_quantity) DESC`
+        );
+        return rows;
     },
 
     /**
@@ -188,20 +145,14 @@ const Ingredient = {
      * @returns {Object} Updated ingredient
      */
     async updateStock(id, newQuantity) {
-        const { data, error } = await supabase
-            .from('ingredients')
-            .update({ stock_quantity: newQuantity })
-            .eq('id', id)
-            .select('*')
-            .single();
+        const { rows } = await query(
+            'UPDATE ingredients SET stock_quantity = $2 WHERE id = $1 RETURNING *',
+            [id, newQuantity]
+        );
 
-        if (error) {
-            console.error('❌ Error updating stock:', error);
-            throw error;
-        }
-
-        console.log(`✅ Stock updated: ${data.name} = ${newQuantity} ${data.unit}`);
-        return data;
+        if (rows.length === 0) throw new Error('Ingredient not found');
+        console.log(`✅ Stock updated: ${rows[0].name} = ${newQuantity} ${rows[0].unit}`);
+        return rows[0];
     },
 
     /**
@@ -211,11 +162,8 @@ const Ingredient = {
      * @returns {Object} Updated ingredient
      */
     async adjustStock(id, adjustment) {
-        // First get current stock
         const current = await this.findById(id);
-        if (!current) {
-            throw new Error(`Ingredient ${id} not found`);
-        }
+        if (!current) throw new Error(`Ingredient ${id} not found`);
 
         const newQuantity = Math.max(0, parseFloat(current.stock_quantity) + parseFloat(adjustment));
         return this.updateStock(id, newQuantity);
@@ -228,12 +176,10 @@ const Ingredient = {
      */
     async batchAdjustStock(updates) {
         const results = [];
-
         for (const update of updates) {
             const result = await this.adjustStock(update.id, update.adjustment);
             results.push(result);
         }
-
         return results;
     },
 
@@ -271,10 +217,7 @@ const Ingredient = {
             }
         }
 
-        return {
-            sufficient: shortages.length === 0,
-            shortages
-        };
+        return { sufficient: shortages.length === 0, shortages };
     }
 };
 

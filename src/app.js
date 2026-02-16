@@ -15,6 +15,7 @@ import recipeRoutes from './routes/recipes.js';
 import orderRoutes from './routes/orders.js';
 import reportRoutes from './routes/reports.js';
 import chatbotRoutes from './routes/chatbot.js';
+import { ollamaChatbotRoutes } from './chatbot/index.js';
 
 // Import error handlers
 import { notFoundHandler, errorHandler } from './middlewares/errorHandler.js';
@@ -88,6 +89,7 @@ app.use('/api/recipes', recipeRoutes);
 app.use('/api/orders', orderRoutes);
 app.use('/api/reports', reportRoutes);
 app.use('/api/chatbot', chatbotRoutes);
+app.use('/api/ollama-chat', ollamaChatbotRoutes);
 
 // ============================================
 // ERROR HANDLING
@@ -122,6 +124,7 @@ app.listen(PORT, () => {
     console.log('  GET  /api/orders');
     console.log('  GET  /api/reports/dashboard');
     console.log('  GET  /api/chatbot/menu');
+    console.log('  POST /api/ollama-chat/chat');
     console.log('');
     console.log('🟢 Ready to accept connections');
     console.log('');

@@ -3,7 +3,7 @@
  * Handles many-to-many relationship between products and ingredients
  */
 
-import supabase from '../utils/supabaseClient.js';
+import { query, getClient } from '../utils/db.js';
 
 const Recipe = {
     /**
@@ -12,21 +12,17 @@ const Recipe = {
      * @returns {Object|null} Recipe object or null
      */
     async findById(id) {
-        const { data, error } = await supabase
-            .from('recipes')
-            .select(`
-        *,
-        products (id, name, selling_price),
-        ingredients (id, name, unit, unit_price)
-      `)
-            .eq('id', id)
-            .single();
-
-        if (error && error.code !== 'PGRST116') {
-            console.error('❌ Error finding recipe:', error);
-            throw error;
-        }
-        return data;
+        const { rows } = await query(
+            `SELECT r.*, 
+                    json_build_object('id', p.id, 'name', p.name, 'selling_price', p.selling_price) AS products,
+                    json_build_object('id', i.id, 'name', i.name, 'unit', i.unit, 'unit_price', i.unit_price) AS ingredients
+             FROM recipes r
+             JOIN products p ON r.product_id = p.id
+             JOIN ingredients i ON r.ingredient_id = i.id
+             WHERE r.id = $1`,
+            [id]
+        );
+        return rows[0] || null;
     },
 
     /**
@@ -35,37 +31,26 @@ const Recipe = {
      * @returns {Array} Recipe items with ingredient details
      */
     async findByProductId(productId) {
-        const { data, error } = await supabase
-            .from('recipes')
-            .select(`
-        id,
-        quantity_needed,
-        created_at,
-        ingredients (
-          id,
-          name,
-          unit,
-          unit_price,
-          stock_quantity
-        )
-      `)
-            .eq('product_id', productId)
-            .order('created_at', { ascending: true });
+        const { rows } = await query(
+            `SELECT r.id, r.quantity_needed, r.created_at,
+                    i.id AS ingredient_id, i.name AS ingredient_name, i.unit,
+                    i.unit_price, i.stock_quantity
+             FROM recipes r
+             JOIN ingredients i ON r.ingredient_id = i.id
+             WHERE r.product_id = $1
+             ORDER BY r.created_at ASC`,
+            [productId]
+        );
 
-        if (error) {
-            console.error('❌ Error finding recipes for product:', error);
-            throw error;
-        }
-
-        return data.map(r => ({
+        return rows.map(r => ({
             id: r.id,
-            ingredient_id: r.ingredients.id,
-            ingredient_name: r.ingredients.name,
-            unit: r.ingredients.unit,
+            ingredient_id: r.ingredient_id,
+            ingredient_name: r.ingredient_name,
+            unit: r.unit,
             quantity_needed: r.quantity_needed,
-            unit_price: r.ingredients.unit_price,
-            stock_quantity: r.ingredients.stock_quantity,
-            ingredient_cost: r.quantity_needed * r.ingredients.unit_price,
+            unit_price: r.unit_price,
+            stock_quantity: r.stock_quantity,
+            ingredient_cost: r.quantity_needed * r.unit_price,
             created_at: r.created_at
         }));
     },
@@ -76,58 +61,44 @@ const Recipe = {
      * @returns {Array} Products using this ingredient
      */
     async findByIngredientId(ingredientId) {
-        const { data, error } = await supabase
-            .from('recipes')
-            .select(`
-        id,
-        quantity_needed,
-        products (
-          id,
-          name,
-          selling_price,
-          is_available
-        )
-      `)
-            .eq('ingredient_id', ingredientId);
-
-        if (error) {
-            console.error('❌ Error finding products for ingredient:', error);
-            throw error;
-        }
-
-        return data;
+        const { rows } = await query(
+            `SELECT r.id, r.quantity_needed,
+                    json_build_object('id', p.id, 'name', p.name, 'selling_price', p.selling_price, 'is_available', p.is_available) AS products
+             FROM recipes r
+             JOIN products p ON r.product_id = p.id
+             WHERE r.ingredient_id = $1`,
+            [ingredientId]
+        );
+        return rows;
     },
 
     /**
-     * Create or update recipe item
-     * Uses upsert to handle both create and update
+     * Create or update recipe item (upsert)
      * @param {Object} recipeData - { product_id, ingredient_id, quantity_needed }
      * @returns {Object} Created/updated recipe
      */
     async upsert(recipeData) {
-        const { data, error } = await supabase
-            .from('recipes')
-            .upsert({
-                product_id: recipeData.product_id,
-                ingredient_id: recipeData.ingredient_id,
-                quantity_needed: recipeData.quantity_needed
-            }, {
-                onConflict: 'product_id,ingredient_id'
-            })
-            .select(`
-        id,
-        quantity_needed,
-        ingredients (id, name, unit, unit_price)
-      `)
-            .single();
+        const { rows } = await query(
+            `INSERT INTO recipes (product_id, ingredient_id, quantity_needed)
+             VALUES ($1, $2, $3)
+             ON CONFLICT (product_id, ingredient_id)
+             DO UPDATE SET quantity_needed = EXCLUDED.quantity_needed
+             RETURNING *`,
+            [recipeData.product_id, recipeData.ingredient_id, recipeData.quantity_needed]
+        );
 
-        if (error) {
-            console.error('❌ Error upserting recipe:', error);
-            throw error;
-        }
+        // Fetch with ingredient details
+        const { rows: detailRows } = await query(
+            `SELECT r.id, r.quantity_needed,
+                    json_build_object('id', i.id, 'name', i.name, 'unit', i.unit, 'unit_price', i.unit_price) AS ingredients
+             FROM recipes r
+             JOIN ingredients i ON r.ingredient_id = i.id
+             WHERE r.id = $1`,
+            [rows[0].id]
+        );
 
         console.log(`✅ Recipe updated: ${recipeData.product_id} <- ${recipeData.ingredient_id}`);
-        return data;
+        return detailRows[0];
     },
 
     /**
@@ -136,29 +107,25 @@ const Recipe = {
      * @returns {Object} Created recipe
      */
     async create(recipeData) {
-        const { data, error } = await supabase
-            .from('recipes')
-            .insert({
-                product_id: recipeData.product_id,
-                ingredient_id: recipeData.ingredient_id,
-                quantity_needed: recipeData.quantity_needed
-            })
-            .select(`
-        id,
-        product_id,
-        ingredient_id,
-        quantity_needed,
-        ingredients (id, name, unit, unit_price)
-      `)
-            .single();
+        const { rows } = await query(
+            `INSERT INTO recipes (product_id, ingredient_id, quantity_needed)
+             VALUES ($1, $2, $3)
+             RETURNING *`,
+            [recipeData.product_id, recipeData.ingredient_id, recipeData.quantity_needed]
+        );
 
-        if (error) {
-            console.error('❌ Error creating recipe:', error);
-            throw error;
-        }
+        // Fetch with ingredient details
+        const { rows: detailRows } = await query(
+            `SELECT r.id, r.product_id, r.ingredient_id, r.quantity_needed,
+                    json_build_object('id', i.id, 'name', i.name, 'unit', i.unit, 'unit_price', i.unit_price) AS ingredients
+             FROM recipes r
+             JOIN ingredients i ON r.ingredient_id = i.id
+             WHERE r.id = $1`,
+            [rows[0].id]
+        );
 
         console.log(`✅ Recipe created for product ${recipeData.product_id}`);
-        return data;
+        return detailRows[0];
     },
 
     /**
@@ -168,23 +135,23 @@ const Recipe = {
      * @returns {Object} Updated recipe
      */
     async update(id, updateData) {
-        const { data, error } = await supabase
-            .from('recipes')
-            .update({ quantity_needed: updateData.quantity_needed })
-            .eq('id', id)
-            .select(`
-        id,
-        quantity_needed,
-        ingredients (id, name, unit)
-      `)
-            .single();
+        const { rows } = await query(
+            `UPDATE recipes SET quantity_needed = $2 WHERE id = $1 RETURNING *`,
+            [id, updateData.quantity_needed]
+        );
 
-        if (error) {
-            console.error('❌ Error updating recipe:', error);
-            throw error;
-        }
+        if (rows.length === 0) throw new Error('Recipe not found');
 
-        return data;
+        const { rows: detailRows } = await query(
+            `SELECT r.id, r.quantity_needed,
+                    json_build_object('id', i.id, 'name', i.name, 'unit', i.unit) AS ingredients
+             FROM recipes r
+             JOIN ingredients i ON r.ingredient_id = i.id
+             WHERE r.id = $1`,
+            [id]
+        );
+
+        return detailRows[0];
     },
 
     /**
@@ -193,16 +160,7 @@ const Recipe = {
      * @returns {boolean} True if deleted
      */
     async delete(id) {
-        const { error } = await supabase
-            .from('recipes')
-            .delete()
-            .eq('id', id);
-
-        if (error) {
-            console.error('❌ Error deleting recipe:', error);
-            throw error;
-        }
-
+        await query('DELETE FROM recipes WHERE id = $1', [id]);
         console.log(`✅ Recipe deleted: ${id}`);
         return true;
     },
@@ -213,54 +171,57 @@ const Recipe = {
      * @returns {boolean} True if deleted
      */
     async deleteByProductId(productId) {
-        const { error } = await supabase
-            .from('recipes')
-            .delete()
-            .eq('product_id', productId);
-
-        if (error) {
-            console.error('❌ Error deleting recipes for product:', error);
-            throw error;
-        }
-
+        await query('DELETE FROM recipes WHERE product_id = $1', [productId]);
         console.log(`✅ All recipes deleted for product: ${productId}`);
         return true;
     },
 
     /**
      * Bulk create/update recipes for a product
-     * Replaces all existing recipes with new ones
      * @param {string} productId - Product UUID
      * @param {Array} ingredients - Array of { ingredient_id, quantity_needed }
      * @returns {Array} Created recipes
      */
     async bulkUpdate(productId, ingredients) {
-        // Delete existing recipes
-        await this.deleteByProductId(productId);
+        const client = await getClient();
+        try {
+            await client.query('BEGIN');
 
-        // Create new recipes
-        const recipesToInsert = ingredients.map(ing => ({
-            product_id: productId,
-            ingredient_id: ing.ingredient_id,
-            quantity_needed: ing.quantity_needed
-        }));
+            // Delete existing recipes
+            await client.query('DELETE FROM recipes WHERE product_id = $1', [productId]);
 
-        const { data, error } = await supabase
-            .from('recipes')
-            .insert(recipesToInsert)
-            .select(`
-        id,
-        quantity_needed,
-        ingredients (id, name, unit, unit_price)
-      `);
+            // Insert new recipes
+            const results = [];
+            for (const ing of ingredients) {
+                const { rows } = await client.query(
+                    `INSERT INTO recipes (product_id, ingredient_id, quantity_needed)
+                     VALUES ($1, $2, $3)
+                     RETURNING *`,
+                    [productId, ing.ingredient_id, ing.quantity_needed]
+                );
+                results.push(rows[0]);
+            }
 
-        if (error) {
-            console.error('❌ Error bulk updating recipes:', error);
+            await client.query('COMMIT');
+
+            // Fetch with ingredient details
+            const { rows: detailRows } = await query(
+                `SELECT r.id, r.quantity_needed,
+                        json_build_object('id', i.id, 'name', i.name, 'unit', i.unit, 'unit_price', i.unit_price) AS ingredients
+                 FROM recipes r
+                 JOIN ingredients i ON r.ingredient_id = i.id
+                 WHERE r.product_id = $1`,
+                [productId]
+            );
+
+            console.log(`✅ Bulk updated ${detailRows.length} recipes for product ${productId}`);
+            return detailRows;
+        } catch (error) {
+            await client.query('ROLLBACK');
             throw error;
+        } finally {
+            client.release();
         }
-
-        console.log(`✅ Bulk updated ${data.length} recipes for product ${productId}`);
-        return data;
     },
 
     /**
@@ -270,12 +231,8 @@ const Recipe = {
      */
     async calculateCost(productId) {
         const recipes = await this.findByProductId(productId);
-
-        const totalCost = recipes.reduce((sum, r) => {
-            return sum + (r.quantity_needed * r.unit_price);
-        }, 0);
-
-        return Math.round(totalCost * 100) / 100; // Round to 2 decimal places
+        const totalCost = recipes.reduce((sum, r) => sum + (r.quantity_needed * r.unit_price), 0);
+        return Math.round(totalCost * 100) / 100;
     },
 
     /**
@@ -286,7 +243,6 @@ const Recipe = {
      */
     async getStockRequirements(productId, quantity = 1) {
         const recipes = await this.findByProductId(productId);
-
         return recipes.map(r => ({
             ingredient_id: r.ingredient_id,
             ingredient_name: r.ingredient_name,

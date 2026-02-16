@@ -3,7 +3,7 @@
  * Handles orders, order items, and order revisions
  */
 
-import supabase from '../utils/supabaseClient.js';
+import { query, getClient } from '../utils/db.js';
 
 const Order = {
     /**
@@ -12,46 +12,34 @@ const Order = {
      * @returns {Object|null} Order with items or null
      */
     async findById(id) {
-        const { data: order, error: orderError } = await supabase
-            .from('orders')
-            .select(`
-        *,
-        users!orders_customer_id_fkey (id, email, full_name, phone)
-      `)
-            .eq('id', id)
-            .single();
+        const { rows: orderRows } = await query(
+            `SELECT o.*,
+                    json_build_object('id', u.id, 'email', u.email, 'full_name', u.full_name, 'phone', u.phone) AS customer
+             FROM orders o
+             JOIN users u ON o.customer_id = u.id
+             WHERE o.id = $1`,
+            [id]
+        );
 
-        if (orderError) {
-            if (orderError.code === 'PGRST116') return null;
-            console.error('❌ Error finding order:', orderError);
-            throw orderError;
-        }
+        if (orderRows.length === 0) return null;
+        const order = orderRows[0];
 
-        // Get order items
-        const { data: items, error: itemsError } = await supabase
-            .from('order_items')
-            .select(`
-        id,
-        quantity,
-        unit_price,
-        subtotal,
-        products (id, name, image_url)
-      `)
-            .eq('order_id', id);
-
-        if (itemsError) {
-            console.error('❌ Error finding order items:', itemsError);
-            throw itemsError;
-        }
+        const { rows: items } = await query(
+            `SELECT oi.id, oi.quantity, oi.unit_price, oi.subtotal,
+                    p.id AS product_id, p.name AS product_name, p.image_url AS product_image
+             FROM order_items oi
+             JOIN products p ON oi.product_id = p.id
+             WHERE oi.order_id = $1`,
+            [id]
+        );
 
         return {
             ...order,
-            customer: order.users,
             items: items.map(item => ({
                 id: item.id,
-                product_id: item.products.id,
-                product_name: item.products.name,
-                product_image: item.products.image_url,
+                product_id: item.product_id,
+                product_name: item.product_name,
+                product_image: item.product_image,
                 quantity: item.quantity,
                 unit_price: item.unit_price,
                 subtotal: item.subtotal
@@ -65,21 +53,13 @@ const Order = {
      * @returns {Object|null} Order or null
      */
     async findByOrderNumber(orderNumber) {
-        const { data, error } = await supabase
-            .from('orders')
-            .select('*')
-            .eq('order_number', orderNumber)
-            .single();
+        const { rows } = await query(
+            'SELECT id FROM orders WHERE order_number = $1',
+            [orderNumber]
+        );
 
-        if (error && error.code !== 'PGRST116') {
-            console.error('❌ Error finding order by number:', error);
-            throw error;
-        }
-
-        if (data) {
-            return this.findById(data.id);
-        }
-        return null;
+        if (rows.length === 0) return null;
+        return this.findById(rows[0].id);
     },
 
     /**
@@ -88,42 +68,45 @@ const Order = {
      * @returns {Object} { orders, total, page, limit, totalPages }
      */
     async findAll({ page = 1, limit = 20, status = null, customer_id = null } = {}) {
-        let query = supabase
-            .from('orders')
-            .select(`
-        *,
-        users!orders_customer_id_fkey (id, email, full_name)
-      `, { count: 'exact' });
+        const conditions = [];
+        const params = [];
+        let paramIdx = 1;
 
         if (status) {
-            query = query.eq('status', status);
+            conditions.push(`o.status = $${paramIdx++}`);
+            params.push(status);
         }
-
         if (customer_id) {
-            query = query.eq('customer_id', customer_id);
+            conditions.push(`o.customer_id = $${paramIdx++}`);
+            params.push(customer_id);
         }
 
-        const from = (page - 1) * limit;
-        const to = from + limit - 1;
+        const whereClause = conditions.length > 0 ? 'WHERE ' + conditions.join(' AND ') : '';
 
-        const { data, error, count } = await query
-            .order('created_at', { ascending: false })
-            .range(from, to);
+        const countResult = await query(
+            `SELECT COUNT(*) FROM orders o ${whereClause}`,
+            params
+        );
+        const total = parseInt(countResult.rows[0].count);
 
-        if (error) {
-            console.error('❌ Error finding orders:', error);
-            throw error;
-        }
+        const offset = (page - 1) * limit;
+        const { rows } = await query(
+            `SELECT o.*,
+                    json_build_object('id', u.id, 'email', u.email, 'full_name', u.full_name) AS customer
+             FROM orders o
+             JOIN users u ON o.customer_id = u.id
+             ${whereClause}
+             ORDER BY o.created_at DESC
+             LIMIT $${paramIdx++} OFFSET $${paramIdx++}`,
+            [...params, limit, offset]
+        );
 
         return {
-            orders: data.map(o => ({
-                ...o,
-                customer: o.users
-            })),
-            total: count,
+            orders: rows,
+            total,
             page,
             limit,
-            totalPages: Math.ceil(count / limit)
+            totalPages: Math.ceil(total / limit)
         };
     },
 
@@ -137,18 +120,12 @@ const Order = {
         const dateStr = today.toISOString().slice(0, 10).replace(/-/g, '');
         const prefix = `ORD-${dateStr}-`;
 
-        // Count today's orders
-        const { count, error } = await supabase
-            .from('orders')
-            .select('*', { count: 'exact', head: true })
-            .like('order_number', `${prefix}%`);
+        const { rows } = await query(
+            "SELECT COUNT(*) FROM orders WHERE order_number LIKE $1",
+            [`${prefix}%`]
+        );
 
-        if (error) {
-            console.error('❌ Error counting orders:', error);
-            throw error;
-        }
-
-        const sequence = String(count + 1).padStart(3, '0');
+        const sequence = String(parseInt(rows[0].count) + 1).padStart(3, '0');
         return `${prefix}${sequence}`;
     },
 
@@ -159,68 +136,67 @@ const Order = {
      * @returns {Object} Created order with items
      */
     async create(orderData) {
-        const orderNumber = await this.generateOrderNumber();
+        const client = await getClient();
+        try {
+            await client.query('BEGIN');
 
-        // Calculate total
-        const totalAmount = orderData.items.reduce((sum, item) => {
-            return sum + (item.unit_price * item.quantity);
-        }, 0);
+            const orderNumber = await this.generateOrderNumber();
+            const totalAmount = orderData.items.reduce((sum, item) =>
+                sum + (item.unit_price * item.quantity), 0);
 
-        // Create order
-        const { data: order, error: orderError } = await supabase
-            .from('orders')
-            .insert({
-                customer_id: orderData.customer_id,
-                order_number: orderNumber,
-                total_amount: totalAmount,
-                status: 'pending',
-                notes: orderData.notes || null
-            })
-            .select('*')
-            .single();
+            // Create order
+            const { rows: orderRows } = await client.query(
+                `INSERT INTO orders (customer_id, order_number, total_amount, status, notes)
+                 VALUES ($1, $2, $3, 'pending', $4)
+                 RETURNING *`,
+                [orderData.customer_id, orderNumber, totalAmount, orderData.notes || null]
+            );
+            const order = orderRows[0];
 
-        if (orderError) {
-            console.error('❌ Error creating order:', orderError);
-            throw orderError;
+            // Create order items
+            const items = [];
+            for (const item of orderData.items) {
+                const subtotal = item.unit_price * item.quantity;
+                const { rows: itemRows } = await client.query(
+                    `INSERT INTO order_items (order_id, product_id, quantity, unit_price, subtotal)
+                     VALUES ($1, $2, $3, $4, $5)
+                     RETURNING *`,
+                    [order.id, item.product_id, item.quantity, item.unit_price, subtotal]
+                );
+                items.push(itemRows[0]);
+            }
+
+            await client.query('COMMIT');
+
+            // Fetch product names for items
+            const { rows: detailItems } = await query(
+                `SELECT oi.id, oi.quantity, oi.unit_price, oi.subtotal,
+                        p.id AS product_id, p.name AS product_name
+                 FROM order_items oi
+                 JOIN products p ON oi.product_id = p.id
+                 WHERE oi.order_id = $1`,
+                [order.id]
+            );
+
+            console.log(`✅ Order created: ${orderNumber}`);
+            return {
+                ...order,
+                items: detailItems.map(item => ({
+                    id: item.id,
+                    product_id: item.product_id,
+                    product_name: item.product_name,
+                    quantity: item.quantity,
+                    unit_price: item.unit_price,
+                    subtotal: item.subtotal
+                }))
+            };
+        } catch (error) {
+            await client.query('ROLLBACK');
+            console.error('❌ Error creating order:', error);
+            throw error;
+        } finally {
+            client.release();
         }
-
-        // Create order items
-        const itemsToInsert = orderData.items.map(item => ({
-            order_id: order.id,
-            product_id: item.product_id,
-            quantity: item.quantity,
-            unit_price: item.unit_price,
-            subtotal: item.unit_price * item.quantity
-        }));
-
-        const { data: items, error: itemsError } = await supabase
-            .from('order_items')
-            .insert(itemsToInsert)
-            .select(`
-        id,
-        quantity,
-        unit_price,
-        subtotal,
-        products (id, name)
-      `);
-
-        if (itemsError) {
-            console.error('❌ Error creating order items:', itemsError);
-            throw itemsError;
-        }
-
-        console.log(`✅ Order created: ${orderNumber}`);
-        return {
-            ...order,
-            items: items.map(item => ({
-                id: item.id,
-                product_id: item.products.id,
-                product_name: item.products.name,
-                quantity: item.quantity,
-                unit_price: item.unit_price,
-                subtotal: item.subtotal
-            }))
-        };
     },
 
     /**
@@ -230,20 +206,14 @@ const Order = {
      * @returns {Object} Updated order
      */
     async updateStatus(id, status) {
-        const { data, error } = await supabase
-            .from('orders')
-            .update({ status })
-            .eq('id', id)
-            .select('*')
-            .single();
+        const { rows } = await query(
+            'UPDATE orders SET status = $2 WHERE id = $1 RETURNING *',
+            [id, status]
+        );
 
-        if (error) {
-            console.error('❌ Error updating order status:', error);
-            throw error;
-        }
-
-        console.log(`✅ Order ${data.order_number} status: ${status}`);
-        return data;
+        if (rows.length === 0) throw new Error('Order not found');
+        console.log(`✅ Order ${rows[0].order_number} status: ${status}`);
+        return rows[0];
     },
 
     /**
@@ -253,45 +223,44 @@ const Order = {
      * @returns {Object} Updated order
      */
     async update(id, updateData) {
-        // Update order notes if provided
-        if (updateData.notes !== undefined) {
-            await supabase
-                .from('orders')
-                .update({ notes: updateData.notes })
-                .eq('id', id);
-        }
+        const client = await getClient();
+        try {
+            await client.query('BEGIN');
 
-        // Update items if provided
-        if (updateData.items) {
-            // Delete existing items
-            await supabase
-                .from('order_items')
-                .delete()
-                .eq('order_id', id);
+            if (updateData.notes !== undefined) {
+                await client.query(
+                    'UPDATE orders SET notes = $2 WHERE id = $1',
+                    [id, updateData.notes]
+                );
+            }
 
-            // Calculate new total
-            const totalAmount = updateData.items.reduce((sum, item) => {
-                return sum + (item.unit_price * item.quantity);
-            }, 0);
+            if (updateData.items) {
+                await client.query('DELETE FROM order_items WHERE order_id = $1', [id]);
 
-            // Update order total
-            await supabase
-                .from('orders')
-                .update({ total_amount: totalAmount })
-                .eq('id', id);
+                const totalAmount = updateData.items.reduce((sum, item) =>
+                    sum + (item.unit_price * item.quantity), 0);
 
-            // Insert new items
-            const itemsToInsert = updateData.items.map(item => ({
-                order_id: id,
-                product_id: item.product_id,
-                quantity: item.quantity,
-                unit_price: item.unit_price,
-                subtotal: item.unit_price * item.quantity
-            }));
+                await client.query(
+                    'UPDATE orders SET total_amount = $2 WHERE id = $1',
+                    [id, totalAmount]
+                );
 
-            await supabase
-                .from('order_items')
-                .insert(itemsToInsert);
+                for (const item of updateData.items) {
+                    const subtotal = item.unit_price * item.quantity;
+                    await client.query(
+                        `INSERT INTO order_items (order_id, product_id, quantity, unit_price, subtotal)
+                         VALUES ($1, $2, $3, $4, $5)`,
+                        [id, item.product_id, item.quantity, item.unit_price, subtotal]
+                    );
+                }
+            }
+
+            await client.query('COMMIT');
+        } catch (error) {
+            await client.query('ROLLBACK');
+            throw error;
+        } finally {
+            client.release();
         }
 
         return this.findById(id);
@@ -312,17 +281,7 @@ const Order = {
      * @returns {boolean} True if deleted
      */
     async delete(id) {
-        // Order items will be deleted by CASCADE
-        const { error } = await supabase
-            .from('orders')
-            .delete()
-            .eq('id', id);
-
-        if (error) {
-            console.error('❌ Error deleting order:', error);
-            throw error;
-        }
-
+        await query('DELETE FROM orders WHERE id = $1', [id]);
         console.log(`✅ Order deleted: ${id}`);
         return true;
     },
@@ -333,20 +292,15 @@ const Order = {
      * @returns {Array} Order items
      */
     async getItems(orderId) {
-        const { data, error } = await supabase
-            .from('order_items')
-            .select(`
-        *,
-        products (id, name, image_url)
-      `)
-            .eq('order_id', orderId);
-
-        if (error) {
-            console.error('❌ Error getting order items:', error);
-            throw error;
-        }
-
-        return data;
+        const { rows } = await query(
+            `SELECT oi.*,
+                    json_build_object('id', p.id, 'name', p.name, 'image_url', p.image_url) AS products
+             FROM order_items oi
+             JOIN products p ON oi.product_id = p.id
+             WHERE oi.order_id = $1`,
+            [orderId]
+        );
+        return rows;
     },
 
     // ============================================
@@ -359,26 +313,22 @@ const Order = {
      * @returns {Object} Created revision
      */
     async createRevision(revisionData) {
-        const { data, error } = await supabase
-            .from('order_revisions')
-            .insert({
-                order_id: revisionData.order_id,
-                revised_by: revisionData.revised_by,
-                revision_type: revisionData.revision_type,
-                old_value: revisionData.old_value || null,
-                new_value: revisionData.new_value || null,
-                notes: revisionData.notes || null
-            })
-            .select('*')
-            .single();
-
-        if (error) {
-            console.error('❌ Error creating order revision:', error);
-            throw error;
-        }
+        const { rows } = await query(
+            `INSERT INTO order_revisions (order_id, revised_by, revision_type, old_value, new_value, notes)
+             VALUES ($1, $2, $3, $4, $5, $6)
+             RETURNING *`,
+            [
+                revisionData.order_id,
+                revisionData.revised_by,
+                revisionData.revision_type,
+                revisionData.old_value ? JSON.stringify(revisionData.old_value) : null,
+                revisionData.new_value ? JSON.stringify(revisionData.new_value) : null,
+                revisionData.notes || null
+            ]
+        );
 
         console.log(`✅ Revision recorded: ${revisionData.revision_type}`);
-        return data;
+        return rows[0];
     },
 
     /**
@@ -387,24 +337,16 @@ const Order = {
      * @returns {Array} Order revisions
      */
     async getRevisions(orderId) {
-        const { data, error } = await supabase
-            .from('order_revisions')
-            .select(`
-        *,
-        users!order_revisions_revised_by_fkey (id, email, full_name)
-      `)
-            .eq('order_id', orderId)
-            .order('created_at', { ascending: false });
-
-        if (error) {
-            console.error('❌ Error getting order revisions:', error);
-            throw error;
-        }
-
-        return data.map(r => ({
-            ...r,
-            revised_by_user: r.users
-        }));
+        const { rows } = await query(
+            `SELECT orv.*,
+                    json_build_object('id', u.id, 'email', u.email, 'full_name', u.full_name) AS revised_by_user
+             FROM order_revisions orv
+             JOIN users u ON orv.revised_by = u.id
+             WHERE orv.order_id = $1
+             ORDER BY orv.created_at DESC`,
+            [orderId]
+        );
+        return rows;
     },
 
     // ============================================
@@ -418,20 +360,15 @@ const Order = {
      * @returns {Object} Sales summary
      */
     async getSalesSummary(startDate, endDate) {
-        const { data, error } = await supabase
-            .from('orders')
-            .select('total_amount, status, created_at')
-            .gte('created_at', startDate.toISOString())
-            .lte('created_at', endDate.toISOString())
-            .in('status', ['completed', 'processing']);
+        const { rows } = await query(
+            `SELECT total_amount, status, created_at FROM orders
+             WHERE created_at >= $1 AND created_at <= $2
+             AND status IN ('completed', 'processing')`,
+            [startDate.toISOString(), endDate.toISOString()]
+        );
 
-        if (error) {
-            console.error('❌ Error getting sales summary:', error);
-            throw error;
-        }
-
-        const totalSales = data.reduce((sum, o) => sum + parseFloat(o.total_amount), 0);
-        const orderCount = data.length;
+        const totalSales = rows.reduce((sum, o) => sum + parseFloat(o.total_amount), 0);
+        const orderCount = rows.length;
 
         return {
             total_sales: totalSales,
@@ -450,53 +387,42 @@ const Order = {
      * @returns {Array} Popular products
      */
     async getPopularProducts(limit = 10, startDate = null, endDate = null) {
-        let query = supabase
-            .from('order_items')
-            .select(`
-        product_id,
-        quantity,
-        subtotal,
-        orders!inner (status, created_at),
-        products (name, selling_price)
-      `)
-            .in('orders.status', ['completed', 'processing']);
+        const conditions = ["o.status IN ('completed', 'processing')"];
+        const params = [];
+        let paramIdx = 1;
 
         if (startDate) {
-            query = query.gte('orders.created_at', startDate.toISOString());
+            conditions.push(`o.created_at >= $${paramIdx++}`);
+            params.push(startDate.toISOString());
         }
         if (endDate) {
-            query = query.lte('orders.created_at', endDate.toISOString());
+            conditions.push(`o.created_at <= $${paramIdx++}`);
+            params.push(endDate.toISOString());
         }
 
-        const { data, error } = await query;
+        const { rows } = await query(
+            `SELECT oi.product_id, p.name AS product_name, p.selling_price,
+                    SUM(oi.quantity) AS total_quantity,
+                    SUM(oi.subtotal) AS total_revenue,
+                    COUNT(*) AS order_count
+             FROM order_items oi
+             JOIN orders o ON oi.order_id = o.id
+             JOIN products p ON oi.product_id = p.id
+             WHERE ${conditions.join(' AND ')}
+             GROUP BY oi.product_id, p.name, p.selling_price
+             ORDER BY total_quantity DESC
+             LIMIT $${paramIdx}`,
+            [...params, limit]
+        );
 
-        if (error) {
-            console.error('❌ Error getting popular products:', error);
-            throw error;
-        }
-
-        // Aggregate by product
-        const productStats = {};
-        data.forEach(item => {
-            if (!productStats[item.product_id]) {
-                productStats[item.product_id] = {
-                    product_id: item.product_id,
-                    product_name: item.products.name,
-                    selling_price: item.products.selling_price,
-                    total_quantity: 0,
-                    total_revenue: 0,
-                    order_count: 0
-                };
-            }
-            productStats[item.product_id].total_quantity += item.quantity;
-            productStats[item.product_id].total_revenue += parseFloat(item.subtotal);
-            productStats[item.product_id].order_count += 1;
-        });
-
-        // Sort by quantity and limit
-        return Object.values(productStats)
-            .sort((a, b) => b.total_quantity - a.total_quantity)
-            .slice(0, limit);
+        return rows.map(r => ({
+            product_id: r.product_id,
+            product_name: r.product_name,
+            selling_price: parseFloat(r.selling_price),
+            total_quantity: parseInt(r.total_quantity),
+            total_revenue: parseFloat(r.total_revenue),
+            order_count: parseInt(r.order_count)
+        }));
     }
 };
 

@@ -3,7 +3,7 @@
  * Handles all database operations for users table
  */
 
-import supabase from '../utils/supabaseClient.js';
+import { query } from '../utils/db.js';
 import bcrypt from 'bcryptjs';
 
 const User = {
@@ -13,17 +13,11 @@ const User = {
      * @returns {Object|null} User object or null
      */
     async findById(id) {
-        const { data, error } = await supabase
-            .from('users')
-            .select('id, email, full_name, role, phone, created_at, updated_at')
-            .eq('id', id)
-            .single();
-
-        if (error) {
-            console.error('❌ Error finding user by ID:', error);
-            return null;
-        }
-        return data;
+        const { rows } = await query(
+            'SELECT id, email, full_name, role, phone, created_at, updated_at FROM users WHERE id = $1',
+            [id]
+        );
+        return rows[0] || null;
     },
 
     /**
@@ -32,16 +26,11 @@ const User = {
      * @returns {Object|null} User object (including password) or null
      */
     async findByEmail(email) {
-        const { data, error } = await supabase
-            .from('users')
-            .select('*')
-            .eq('email', email)
-            .single();
-
-        if (error && error.code !== 'PGRST116') { // PGRST116 = no rows
-            console.error('❌ Error finding user by email:', error);
-        }
-        return data;
+        const { rows } = await query(
+            'SELECT * FROM users WHERE email = $1',
+            [email]
+        );
+        return rows[0] || null;
     },
 
     /**
@@ -50,29 +39,24 @@ const User = {
      * @returns {Object} Created user (without password)
      */
     async create(userData) {
-        // Hash password
         const salt = await bcrypt.genSalt(10);
         const hashedPassword = await bcrypt.hash(userData.password, salt);
 
-        const { data, error } = await supabase
-            .from('users')
-            .insert({
-                email: userData.email,
-                password: hashedPassword,
-                full_name: userData.full_name,
-                role: userData.role || 'customer',
-                phone: userData.phone || null
-            })
-            .select('id, email, full_name, role, phone, created_at')
-            .single();
+        const { rows } = await query(
+            `INSERT INTO users (email, password, full_name, role, phone)
+             VALUES ($1, $2, $3, $4, $5)
+             RETURNING id, email, full_name, role, phone, created_at`,
+            [
+                userData.email,
+                hashedPassword,
+                userData.full_name,
+                userData.role || 'customer',
+                userData.phone || null
+            ]
+        );
 
-        if (error) {
-            console.error('❌ Error creating user:', error);
-            throw error;
-        }
-
-        console.log(`✅ User created: ${data.email}`);
-        return data;
+        console.log(`✅ User created: ${rows[0].email}`);
+        return rows[0];
     },
 
     /**
@@ -82,26 +66,24 @@ const User = {
      * @returns {Object} Updated user
      */
     async update(id, updateData) {
-        // If updating password, hash it
         if (updateData.password) {
             const salt = await bcrypt.genSalt(10);
             updateData.password = await bcrypt.hash(updateData.password, salt);
         }
 
-        const { data, error } = await supabase
-            .from('users')
-            .update(updateData)
-            .eq('id', id)
-            .select('id, email, full_name, role, phone, created_at, updated_at')
-            .single();
+        const fields = Object.keys(updateData);
+        const values = Object.values(updateData);
+        const setClause = fields.map((f, i) => `${f} = $${i + 2}`).join(', ');
 
-        if (error) {
-            console.error('❌ Error updating user:', error);
-            throw error;
-        }
+        const { rows } = await query(
+            `UPDATE users SET ${setClause} WHERE id = $1
+             RETURNING id, email, full_name, role, phone, created_at, updated_at`,
+            [id, ...values]
+        );
 
-        console.log(`✅ User updated: ${data.email}`);
-        return data;
+        if (rows.length === 0) throw new Error('User not found');
+        console.log(`✅ User updated: ${rows[0].email}`);
+        return rows[0];
     },
 
     /**
@@ -117,35 +99,39 @@ const User = {
     /**
      * Get all users (admin function)
      * @param {Object} options - { page, limit, role }
-     * @returns {Array} List of users
+     * @returns {Object} List of users with pagination
      */
     async findAll({ page = 1, limit = 10, role = null } = {}) {
-        let query = supabase
-            .from('users')
-            .select('id, email, full_name, role, phone, created_at, updated_at', { count: 'exact' });
+        const offset = (page - 1) * limit;
+        let whereClause = '';
+        const params = [];
 
         if (role) {
-            query = query.eq('role', role);
+            whereClause = 'WHERE role = $1';
+            params.push(role);
         }
 
-        const from = (page - 1) * limit;
-        const to = from + limit - 1;
+        const countResult = await query(
+            `SELECT COUNT(*) FROM users ${whereClause}`,
+            params
+        );
+        const total = parseInt(countResult.rows[0].count);
 
-        const { data, error, count } = await query
-            .order('created_at', { ascending: false })
-            .range(from, to);
-
-        if (error) {
-            console.error('❌ Error finding users:', error);
-            throw error;
-        }
+        const dataParams = [...params, limit, offset];
+        const { rows } = await query(
+            `SELECT id, email, full_name, role, phone, created_at, updated_at
+             FROM users ${whereClause}
+             ORDER BY created_at DESC
+             LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
+            dataParams
+        );
 
         return {
-            users: data,
-            total: count,
+            users: rows,
+            total,
             page,
             limit,
-            totalPages: Math.ceil(count / limit)
+            totalPages: Math.ceil(total / limit)
         };
     },
 
@@ -155,16 +141,7 @@ const User = {
      * @returns {boolean} True if deleted
      */
     async delete(id) {
-        const { error } = await supabase
-            .from('users')
-            .delete()
-            .eq('id', id);
-
-        if (error) {
-            console.error('❌ Error deleting user:', error);
-            throw error;
-        }
-
+        await query('DELETE FROM users WHERE id = $1', [id]);
         console.log(`✅ User deleted: ${id}`);
         return true;
     }

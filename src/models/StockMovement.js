@@ -3,44 +3,41 @@
  * Tracks all stock changes for audit trail
  */
 
-import supabase from '../utils/supabaseClient.js';
+import { query } from '../utils/db.js';
 
 const StockMovement = {
     /**
      * Create a stock movement record
      * @param {Object} movementData - Movement data
-     * @param {string} movementData.ingredient_id - Ingredient UUID
-     * @param {string} movementData.movement_type - 'in', 'out', or 'adjustment'
-     * @param {number} movementData.quantity - Movement quantity (positive for in, negative for out)
-     * @param {string} movementData.reference_type - 'order', 'purchase', 'manual', 'order_cancel'
-     * @param {string} movementData.reference_id - Related order/purchase ID
-     * @param {string} movementData.notes - Additional notes
      * @returns {Object} Created movement record
      */
     async create(movementData) {
-        const { data, error } = await supabase
-            .from('stock_movements')
-            .insert({
-                ingredient_id: movementData.ingredient_id,
-                movement_type: movementData.movement_type,
-                quantity: movementData.quantity,
-                reference_type: movementData.reference_type,
-                reference_id: movementData.reference_id || null,
-                notes: movementData.notes || null
-            })
-            .select(`
-        *,
-        ingredients (id, name, unit)
-      `)
-            .single();
+        const { rows } = await query(
+            `INSERT INTO stock_movements (ingredient_id, movement_type, quantity, reference_type, reference_id, notes)
+             VALUES ($1, $2, $3, $4, $5, $6)
+             RETURNING *`,
+            [
+                movementData.ingredient_id,
+                movementData.movement_type,
+                movementData.quantity,
+                movementData.reference_type,
+                movementData.reference_id || null,
+                movementData.notes || null
+            ]
+        );
 
-        if (error) {
-            console.error('❌ Error creating stock movement:', error);
-            throw error;
-        }
+        // Fetch with ingredient details
+        const { rows: detailRows } = await query(
+            `SELECT sm.*, json_build_object('id', i.id, 'name', i.name, 'unit', i.unit) AS ingredients
+             FROM stock_movements sm
+             JOIN ingredients i ON sm.ingredient_id = i.id
+             WHERE sm.id = $1`,
+            [rows[0].id]
+        );
 
-        console.log(`📦 Stock ${movementData.movement_type}: ${movementData.quantity} (${data.ingredients.name})`);
-        return data;
+        const result = detailRows[0];
+        console.log(`📦 Stock ${movementData.movement_type}: ${movementData.quantity} (${result.ingredients.name})`);
+        return result;
     },
 
     /**
@@ -49,21 +46,32 @@ const StockMovement = {
      * @returns {Array} Created movements
      */
     async createBatch(movements) {
-        const { data, error } = await supabase
-            .from('stock_movements')
-            .insert(movements)
-            .select(`
-        *,
-        ingredients (id, name, unit)
-      `);
-
-        if (error) {
-            console.error('❌ Error creating batch stock movements:', error);
-            throw error;
+        const results = [];
+        for (const m of movements) {
+            const { rows } = await query(
+                `INSERT INTO stock_movements (ingredient_id, movement_type, quantity, reference_type, reference_id, notes)
+                 VALUES ($1, $2, $3, $4, $5, $6)
+                 RETURNING *`,
+                [m.ingredient_id, m.movement_type, m.quantity, m.reference_type, m.reference_id || null, m.notes || null]
+            );
+            results.push(rows[0]);
         }
 
-        console.log(`📦 Batch stock movement: ${data.length} items`);
-        return data;
+        // Fetch with ingredient details
+        if (results.length > 0) {
+            const ids = results.map(r => r.id);
+            const { rows: detailRows } = await query(
+                `SELECT sm.*, json_build_object('id', i.id, 'name', i.name, 'unit', i.unit) AS ingredients
+                 FROM stock_movements sm
+                 JOIN ingredients i ON sm.ingredient_id = i.id
+                 WHERE sm.id = ANY($1)`,
+                [ids]
+            );
+            console.log(`📦 Batch stock movement: ${detailRows.length} items`);
+            return detailRows;
+        }
+
+        return results;
     },
 
     /**
@@ -73,53 +81,47 @@ const StockMovement = {
      * @returns {Object} Movements with pagination
      */
     async findByIngredient(ingredientId, { page = 1, limit = 50 } = {}) {
-        const from = (page - 1) * limit;
-        const to = from + limit - 1;
+        const offset = (page - 1) * limit;
 
-        const { data, error, count } = await supabase
-            .from('stock_movements')
-            .select('*', { count: 'exact' })
-            .eq('ingredient_id', ingredientId)
-            .order('created_at', { ascending: false })
-            .range(from, to);
+        const countResult = await query(
+            'SELECT COUNT(*) FROM stock_movements WHERE ingredient_id = $1',
+            [ingredientId]
+        );
+        const total = parseInt(countResult.rows[0].count);
 
-        if (error) {
-            console.error('❌ Error finding stock movements:', error);
-            throw error;
-        }
+        const { rows } = await query(
+            `SELECT * FROM stock_movements
+             WHERE ingredient_id = $1
+             ORDER BY created_at DESC
+             LIMIT $2 OFFSET $3`,
+            [ingredientId, limit, offset]
+        );
 
         return {
-            movements: data,
-            total: count,
+            movements: rows,
+            total,
             page,
             limit,
-            totalPages: Math.ceil(count / limit)
+            totalPages: Math.ceil(total / limit)
         };
     },
 
     /**
-     * Get stock movements by reference (e.g., for an order)
+     * Get stock movements by reference
      * @param {string} referenceType - Reference type
      * @param {string} referenceId - Reference UUID
      * @returns {Array} Related movements
      */
     async findByReference(referenceType, referenceId) {
-        const { data, error } = await supabase
-            .from('stock_movements')
-            .select(`
-        *,
-        ingredients (id, name, unit)
-      `)
-            .eq('reference_type', referenceType)
-            .eq('reference_id', referenceId)
-            .order('created_at', { ascending: true });
-
-        if (error) {
-            console.error('❌ Error finding movements by reference:', error);
-            throw error;
-        }
-
-        return data;
+        const { rows } = await query(
+            `SELECT sm.*, json_build_object('id', i.id, 'name', i.name, 'unit', i.unit) AS ingredients
+             FROM stock_movements sm
+             JOIN ingredients i ON sm.ingredient_id = i.id
+             WHERE sm.reference_type = $1 AND sm.reference_id = $2
+             ORDER BY sm.created_at ASC`,
+            [referenceType, referenceId]
+        );
+        return rows;
     },
 
     /**
@@ -128,59 +130,60 @@ const StockMovement = {
      * @returns {Object} Movements with pagination
      */
     async findAll({
-        page = 1,
-        limit = 50,
-        ingredient_id = null,
-        movement_type = null,
-        reference_type = null,
-        start_date = null,
-        end_date = null
+        page = 1, limit = 50,
+        ingredient_id = null, movement_type = null,
+        reference_type = null, start_date = null, end_date = null
     } = {}) {
-        let query = supabase
-            .from('stock_movements')
-            .select(`
-        *,
-        ingredients (id, name, unit)
-      `, { count: 'exact' });
+        const conditions = [];
+        const params = [];
+        let paramIdx = 1;
 
         if (ingredient_id) {
-            query = query.eq('ingredient_id', ingredient_id);
+            conditions.push(`sm.ingredient_id = $${paramIdx++}`);
+            params.push(ingredient_id);
         }
-
         if (movement_type) {
-            query = query.eq('movement_type', movement_type);
+            conditions.push(`sm.movement_type = $${paramIdx++}`);
+            params.push(movement_type);
         }
-
         if (reference_type) {
-            query = query.eq('reference_type', reference_type);
+            conditions.push(`sm.reference_type = $${paramIdx++}`);
+            params.push(reference_type);
         }
-
         if (start_date) {
-            query = query.gte('created_at', start_date);
+            conditions.push(`sm.created_at >= $${paramIdx++}`);
+            params.push(start_date);
         }
-
         if (end_date) {
-            query = query.lte('created_at', end_date);
+            conditions.push(`sm.created_at <= $${paramIdx++}`);
+            params.push(end_date);
         }
 
-        const from = (page - 1) * limit;
-        const to = from + limit - 1;
+        const whereClause = conditions.length > 0 ? 'WHERE ' + conditions.join(' AND ') : '';
 
-        const { data, error, count } = await query
-            .order('created_at', { ascending: false })
-            .range(from, to);
+        const countResult = await query(
+            `SELECT COUNT(*) FROM stock_movements sm ${whereClause}`,
+            params
+        );
+        const total = parseInt(countResult.rows[0].count);
 
-        if (error) {
-            console.error('❌ Error finding stock movements:', error);
-            throw error;
-        }
+        const offset = (page - 1) * limit;
+        const { rows } = await query(
+            `SELECT sm.*, json_build_object('id', i.id, 'name', i.name, 'unit', i.unit) AS ingredients
+             FROM stock_movements sm
+             JOIN ingredients i ON sm.ingredient_id = i.id
+             ${whereClause}
+             ORDER BY sm.created_at DESC
+             LIMIT $${paramIdx++} OFFSET $${paramIdx++}`,
+            [...params, limit, offset]
+        );
 
         return {
-            movements: data,
-            total: count,
+            movements: rows,
+            total,
             page,
             limit,
-            totalPages: Math.ceil(count / limit)
+            totalPages: Math.ceil(total / limit)
         };
     },
 
@@ -191,44 +194,30 @@ const StockMovement = {
      * @returns {Object} Stock movement summary
      */
     async getSummary(startDate, endDate) {
-        const { data, error } = await supabase
-            .from('stock_movements')
-            .select(`
-        ingredient_id,
-        movement_type,
-        quantity,
-        ingredients (name, unit)
-      `)
-            .gte('created_at', startDate.toISOString())
-            .lte('created_at', endDate.toISOString());
+        const { rows } = await query(
+            `SELECT sm.ingredient_id, sm.movement_type, sm.quantity,
+                    i.name AS ingredient_name, i.unit
+             FROM stock_movements sm
+             JOIN ingredients i ON sm.ingredient_id = i.id
+             WHERE sm.created_at >= $1 AND sm.created_at <= $2`,
+            [startDate.toISOString(), endDate.toISOString()]
+        );
 
-        if (error) {
-            console.error('❌ Error getting stock summary:', error);
-            throw error;
-        }
-
-        // Aggregate by ingredient
         const summary = {};
-        data.forEach(m => {
+        rows.forEach(m => {
             if (!summary[m.ingredient_id]) {
                 summary[m.ingredient_id] = {
                     ingredient_id: m.ingredient_id,
-                    ingredient_name: m.ingredients.name,
-                    unit: m.ingredients.unit,
-                    total_in: 0,
-                    total_out: 0,
-                    adjustments: 0
+                    ingredient_name: m.ingredient_name,
+                    unit: m.unit,
+                    total_in: 0, total_out: 0, adjustments: 0
                 };
             }
 
             const qty = parseFloat(m.quantity);
-            if (m.movement_type === 'in') {
-                summary[m.ingredient_id].total_in += qty;
-            } else if (m.movement_type === 'out') {
-                summary[m.ingredient_id].total_out += Math.abs(qty);
-            } else {
-                summary[m.ingredient_id].adjustments += qty;
-            }
+            if (m.movement_type === 'in') summary[m.ingredient_id].total_in += qty;
+            else if (m.movement_type === 'out') summary[m.ingredient_id].total_out += Math.abs(qty);
+            else summary[m.ingredient_id].adjustments += qty;
         });
 
         return Object.values(summary);
@@ -245,12 +234,11 @@ const StockMovement = {
         const movements = ingredients.map(ing => ({
             ingredient_id: ing.ingredient_id,
             movement_type: 'out',
-            quantity: -Math.abs(ing.quantity), // Ensure negative for out
+            quantity: -Math.abs(ing.quantity),
             reference_type: 'order',
             reference_id: orderId,
             notes: notes || `Stock deduction for order ${orderId}`
         }));
-
         return this.createBatch(movements);
     },
 
@@ -264,19 +252,18 @@ const StockMovement = {
         const movements = ingredients.map(ing => ({
             ingredient_id: ing.ingredient_id,
             movement_type: 'in',
-            quantity: Math.abs(ing.quantity), // Ensure positive for in
+            quantity: Math.abs(ing.quantity),
             reference_type: 'order_cancel',
             reference_id: orderId,
             notes: `Stock returned from cancelled order ${orderId}`
         }));
-
         return this.createBatch(movements);
     },
 
     /**
      * Record manual stock adjustment
      * @param {string} ingredientId - Ingredient UUID
-     * @param {number} quantity - Adjustment quantity (positive or negative)
+     * @param {number} quantity - Adjustment quantity
      * @param {string} notes - Reason for adjustment
      * @returns {Object} Created movement
      */
@@ -284,10 +271,8 @@ const StockMovement = {
         return this.create({
             ingredient_id: ingredientId,
             movement_type: 'adjustment',
-            quantity: quantity,
-            reference_type: 'manual',
-            reference_id: null,
-            notes: notes
+            quantity, reference_type: 'manual',
+            reference_id: null, notes
         });
     },
 

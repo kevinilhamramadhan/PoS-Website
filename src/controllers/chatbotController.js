@@ -130,19 +130,42 @@ export const createOrder = asyncHandler(async (req, res) => {
 
     // Find or create customer
     let customer;
-    if (customer_email) {
-        customer = await User.findByEmail(customer_email);
+    let isNewCustomer = false;
 
-        if (!customer) {
-            // For chatbot, we might want to create a guest account
-            // Or require existing customer - depending on business rules
-            throw ApiError.notFound(
-                `Customer dengan email ${customer_email} tidak ditemukan. ` +
-                `Silakan daftar terlebih dahulu.`
-            );
-        }
-    } else {
+    if (!customer_email) {
         throw ApiError.badRequest('Email customer diperlukan untuk membuat order');
+    }
+
+    customer = await User.findByEmail(customer_email);
+
+    if (!customer) {
+        // Auto-create new customer when email not found
+        console.log(`🆕 Creating new customer for email: ${customer_email}`);
+
+        // Generate random password (customer can reset later if needed)
+        const randomPassword = Math.random().toString(36).slice(-8) +
+            Math.random().toString(36).slice(-8).toUpperCase() +
+            '!1';
+
+        // Extract name from email if not provided
+        const extractedName = customer_name ||
+            customer_email.split('@')[0]
+                .replace(/[._]/g, ' ')
+                .replace(/\b\w/g, c => c.toUpperCase());
+
+        try {
+            customer = await User.create({
+                email: customer_email,
+                password: randomPassword,
+                full_name: extractedName,
+                role: 'customer'
+            });
+            isNewCustomer = true;
+            console.log(`✅ New customer created: ${customer.email} (${customer.full_name})`);
+        } catch (createError) {
+            console.error('❌ Failed to create customer:', createError);
+            throw ApiError.internal('Gagal membuat akun customer baru. Silakan coba lagi.');
+        }
     }
 
     // Process items - support both product_id and product_name
@@ -178,12 +201,17 @@ export const createOrder = asyncHandler(async (req, res) => {
     });
 
     // Format response for chatbot
+    const successMessage = isNewCustomer
+        ? `Order berhasil dibuat dengan nomor ${order.order_number}. Akun baru telah dibuat untuk ${customer.email}.`
+        : `Order berhasil dibuat dengan nomor ${order.order_number}`;
+
     res.status(201).json({
         success: true,
-        message: `Order berhasil dibuat dengan nomor ${order.order_number}`,
+        message: successMessage,
         data: {
             order_id: order.id,
             order_number: order.order_number,
+            is_new_customer: isNewCustomer,
             customer: {
                 name: customer.full_name,
                 email: customer.email,
